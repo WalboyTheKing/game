@@ -3,6 +3,7 @@ export interface UserProfile {
   username: string;
   avatar: string;
   title: string;
+  hasChosenNickname?: boolean;
   stats: {
     matchesPlayed: number;
     wins: number;
@@ -13,6 +14,17 @@ export interface UserProfile {
 }
 
 const DEFAULT_AVATARS = ['⚡', '🤖', '👑', '🔥', '🚀', '🎯', '👾', '🦊', '🐯', '💎'];
+const COOL_STARTER_NAMES = [
+  'CyberViper',
+  'NeonGhost',
+  'PulseZero',
+  'ShadowAce',
+  'PixelTitan',
+  'MatrixRider',
+  'GlitchBlade',
+  'AeroStrike',
+];
+
 const TITLES = [
   'Recrue Cyber',
   'Pilote d\'Élite',
@@ -21,22 +33,31 @@ const TITLES = [
   'Légende Invicible',
 ];
 
+export const getRandomStarterName = (): string => {
+  const base = COOL_STARTER_NAMES[Math.floor(Math.random() * COOL_STARTER_NAMES.length)];
+  const num = Math.floor(10 + Math.random() * 89);
+  return `${base}_${num}`;
+};
+
 export const getUserProfile = (): UserProfile => {
   try {
     const saved = localStorage.getItem('arcade_user_profile');
     if (saved) {
-      return JSON.parse(saved);
+      const parsed = JSON.parse(saved);
+      if (parsed && parsed.id) {
+        return parsed;
+      }
     }
   } catch {
     // ignore
   }
 
-  const randomNum = Math.floor(100 + Math.random() * 900);
   const initialProfile: UserProfile = {
     id: 'user_' + Math.random().toString(36).substring(2, 9),
-    username: `Joueur_${randomNum}`,
+    username: getRandomStarterName(),
     avatar: DEFAULT_AVATARS[Math.floor(Math.random() * DEFAULT_AVATARS.length)],
     title: 'Recrue Cyber',
+    hasChosenNickname: false,
     stats: {
       matchesPlayed: 0,
       wins: 0,

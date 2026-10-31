@@ -8,6 +8,7 @@ import { NeonAirHockey } from './components/games/NeonAirHockey';
 import { CyberPong } from './components/games/CyberPong';
 import { LobbyModal } from './components/multiplayer/LobbyModal';
 import { ProfileModal } from './components/multiplayer/ProfileModal';
+import { WelcomeOnboardingModal } from './components/multiplayer/WelcomeOnboardingModal';
 import { getStorageData } from './utils/storage';
 import { getUserProfile, UserProfile } from './utils/userProfile';
 import { sounds } from './utils/audio';
@@ -27,6 +28,11 @@ export const App: React.FC = () => {
   const [userProfile, setUserProfile] = useState<UserProfile>(getUserProfile());
   const [isMuted, setIsMuted] = useState(sounds.getMuted());
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isWelcomeOpen, setIsWelcomeOpen] = useState(() => !getUserProfile().hasChosenNickname);
+  const [pendingJoinCode, setPendingJoinCode] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('join') || params.get('room');
+  });
   const [isLobbyOpen, setIsLobbyOpen] = useState(false);
   const [lobbyGameType, setLobbyGameType] = useState<'hockey' | 'pong'>('hockey');
   const [activeRoomData, setActiveRoomData] = useState<any>(null);
@@ -44,12 +50,9 @@ export const App: React.FC = () => {
     socket.connect();
     loadStats();
 
-    // Auto-join via URL direct invitation (e.g. ?join=AIR-123)
-    const params = new URLSearchParams(window.location.search);
-    const joinCode = params.get('join') || params.get('room');
-
-    if (joinCode) {
-      const targetCode = joinCode.toUpperCase().trim();
+    // Auto-join via URL direct invitation (e.g. ?join=AIR-123) if nickname is already set
+    if (pendingJoinCode && userProfile.hasChosenNickname) {
+      const targetCode = pendingJoinCode.toUpperCase().trim();
       const tryJoin = () => {
         sounds.playLaser();
         socket.send({
@@ -135,6 +138,36 @@ export const App: React.FC = () => {
       setActiveView('pong');
     } else {
       setActiveView('hockey');
+    }
+  };
+
+  const handleWelcomeComplete = (updated: UserProfile) => {
+    setUserProfile(updated);
+    setIsWelcomeOpen(false);
+    loadStats();
+
+    if (pendingJoinCode) {
+      const targetCode = pendingJoinCode.toUpperCase().trim();
+      const sendJoin = () => {
+        sounds.playLaser();
+        socket.send({
+          type: 'join_room',
+          roomId: targetCode,
+          username: updated.username,
+          avatar: updated.avatar,
+          playerKey: updated.id,
+        });
+        setPendingJoinCode(null);
+      };
+
+      if (socket.isConnected()) {
+        sendJoin();
+      } else {
+        const unsub = socket.on('connection_open', () => {
+          sendJoin();
+          unsub();
+        });
+      }
     }
   };
 
@@ -237,6 +270,14 @@ export const App: React.FC = () => {
           setUserProfile(updated);
           loadStats();
         }}
+      />
+
+      {/* First Launch Welcome & Nickname Choice Modal */}
+      <WelcomeOnboardingModal
+        isOpen={isWelcomeOpen}
+        currentProfile={userProfile}
+        invitationRoomCode={pendingJoinCode}
+        onComplete={handleWelcomeComplete}
       />
 
       {/* Footer */}

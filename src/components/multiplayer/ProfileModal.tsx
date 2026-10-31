@@ -28,6 +28,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
       ...profile,
       username: cleanName,
       avatar,
+      hasChosenNickname: true,
     };
     saveUserProfile(updated);
     sounds.playCoin();
