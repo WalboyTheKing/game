@@ -10,7 +10,9 @@ import {
   Copy, 
   Check, 
   ArrowUp,
-  ArrowDown
+  ArrowDown,
+  Share2,
+  Eye
 } from 'lucide-react';
 import { sounds } from '../../utils/audio';
 import { socket } from '../../utils/socket';
@@ -59,6 +61,9 @@ export const CyberPong: React.FC<CyberPongProps> = ({
     maxScore: initialRoomData?.maxScore || 5,
   });
 
+  const [copiedLink, setCopiedLink] = useState(false);
+  const [opponentDisconnected, setOpponentDisconnected] = useState(false);
+
   const handleMuteToggle = () => {
     const muted = sounds.toggleMute();
     setIsMuted(muted);
@@ -69,6 +74,15 @@ export const CyberPong: React.FC<CyberPongProps> = ({
       navigator.clipboard.writeText(currentRoom.id);
       setCopiedCode(true);
       setTimeout(() => setCopiedCode(false), 2000);
+    }
+  };
+
+  const copyDirectLink = () => {
+    if (currentRoom?.id && typeof window !== 'undefined') {
+      const url = `${window.location.origin}${window.location.pathname}?join=${currentRoom.id}`;
+      navigator.clipboard.writeText(url);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2500);
     }
   };
 
@@ -87,6 +101,8 @@ export const CyberPong: React.FC<CyberPongProps> = ({
       setFloatingEmojis(prev => prev.filter(e => e.id !== newEmoji.id));
     }, 2500);
   };
+
+  const [disconnectGrace, setDisconnectGrace] = useState<{ active: boolean; user: string; secondsLeft: number } | null>(null);
 
   // --- MULTIPLAYER SOCKET EVENTS ---
   useEffect(() => {
@@ -107,13 +123,20 @@ export const CyberPong: React.FC<CyberPongProps> = ({
 
       if (myRole === 'player1') {
         s.p2Y = data.p2.y;
-      } else {
+      } else if (myRole === 'player2') {
         s.p1Y = data.p1.y;
+      } else {
+        // Authoritative spectator view: both paddles updated
+        s.p1Y = data.p1.y;
+        s.p2Y = data.p2.y;
       }
     });
 
     const unsubPaddleHit = socket.on('paddle_hit', (data) => {
       sounds.playLaser();
+      if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+        try { navigator.vibrate(30); } catch {}
+      }
       const s = localStateRef.current;
       const x = data.side === 'left' ? 35 : TABLE_WIDTH - 35;
       for (let i = 0; i < 10; i++) {
@@ -137,11 +160,16 @@ export const CyberPong: React.FC<CyberPongProps> = ({
       setCountdown(null);
       setCurrentRoom(data.room);
       setIsGameOver(false);
+      setOpponentDisconnected(false);
+      setDisconnectGrace(null);
       sounds.playPowerUp();
     });
 
     const unsubGoal = socket.on('goal_scored', (data) => {
       sounds.playHit();
+      if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+        try { navigator.vibrate([60, 40, 100]); } catch {}
+      }
       setScore1(data.score1);
       setScore2(data.score2);
       confetti({ particleCount: 40, spread: 60, origin: { y: 0.5 } });
@@ -150,6 +178,7 @@ export const CyberPong: React.FC<CyberPongProps> = ({
     const unsubGameOver = socket.on('game_over', (data) => {
       setIsGameOver(true);
       setWinnerName(data.winnerName);
+      setDisconnectGrace(null);
       sounds.playGameOver();
       const isWinner = (myRole === 'player1' && data.winner === 'player1') || (myRole === 'player2' && data.winner === 'player2');
       if (isWinner) {
@@ -165,6 +194,60 @@ export const CyberPong: React.FC<CyberPongProps> = ({
 
     const unsubUpdate = socket.on('room_update', (data) => {
       setCurrentRoom(data.room);
+      if (data.room.status === 'countdown') {
+        setCountdown(data.room.countdown);
+      }
+      if (Object.values(data.room.players || {}).filter((p: any) => p.connected).length >= 2) {
+        setOpponentDisconnected(false);
+        setDisconnectGrace(null);
+      }
+    });
+
+    const unsubGrace = socket.on('player_disconnected_grace', (data) => {
+      setDisconnectGrace({
+        active: true,
+        user: data.username || 'Adversaire',
+        secondsLeft: data.graceSeconds || 30,
+      });
+    });
+
+    const unsubReconnected = socket.on('player_reconnected', (data) => {
+      setDisconnectGrace(null);
+      setOpponentDisconnected(false);
+      setCurrentRoom(data.room);
+      sounds.playPowerUp();
+    });
+
+    const unsubForfeit = socket.on('forfeit_timeout', () => {
+      setDisconnectGrace(null);
+      setOpponentDisconnected(true);
+    });
+
+    const unsubRematch = socket.on('rematch_started', (data) => {
+      setCurrentRoom(data.room);
+      setIsGameOver(false);
+      setCountdown(3);
+      setDisconnectGrace(null);
+      setOpponentDisconnected(false);
+      sounds.playPowerUp();
+    });
+
+    const unsubPlayerLeft = socket.on('player_left', (data) => {
+      setCurrentRoom(data.room);
+      setOpponentDisconnected(true);
+      setDisconnectGrace(null);
+    });
+
+    const unsubOpen = socket.on('connection_open', () => {
+      if (currentRoom?.id) {
+        socket.send({
+          type: 'reconnect_room',
+          roomId: currentRoom.id,
+          playerKey: profile.id,
+          username: profile.username,
+          avatar: profile.avatar,
+        });
+      }
     });
 
     return () => {
@@ -176,11 +259,18 @@ export const CyberPong: React.FC<CyberPongProps> = ({
       unsubGameOver();
       unsubEmoji();
       unsubUpdate();
+      unsubGrace();
+      unsubReconnected();
+      unsubForfeit();
+      unsubRematch();
+      unsubPlayerLeft();
+      unsubOpen();
     };
-  }, [isMultiplayer, myRole, onProfileUpdated]);
+  }, [isMultiplayer, myRole, onProfileUpdated, currentRoom?.id, profile]);
 
   // Pointer movement handler
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (myRole === 'spectator') return; // Spectators cannot move paddles
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -487,9 +577,15 @@ export const CyberPong: React.FC<CyberPongProps> = ({
 
           {isMultiplayer ? (
             <div className="flex items-center gap-2">
-              <span className="flex items-center gap-1.5 text-xs font-bold font-arcade px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                <Users className="w-3.5 h-3.5" /> MULTIJOUEUR PONG
-              </span>
+              {myRole === 'spectator' ? (
+                <span className="flex items-center gap-1.5 text-xs font-bold font-arcade px-2.5 py-1 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/40 animate-pulse">
+                  <Eye className="w-3.5 h-3.5" /> SPECTATEUR DIRECT (60 FPS)
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 text-xs font-bold font-arcade px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                  <Users className="w-3.5 h-3.5" /> MULTIJOUEUR PONG
+                </span>
+              )}
               <button
                 onClick={copyRoomCode}
                 className="flex items-center gap-1 text-xs font-mono font-bold px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 hover:text-white border border-slate-700 transition"
@@ -585,6 +681,41 @@ export const CyberPong: React.FC<CyberPongProps> = ({
           </div>
         )}
 
+        {/* Opponent Disconnect 30s Grace Window Alert */}
+        {disconnectGrace?.active && !isGameOver && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 bg-amber-950/90 border border-amber-500/60 text-amber-200 px-5 py-2.5 rounded-2xl shadow-2xl flex items-center gap-3 backdrop-blur-md animate-pulse">
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping" />
+            <div className="text-left">
+              <span className="text-xs font-bold font-arcade block text-amber-300">
+                Adversaire déconnecté ({disconnectGrace.user})
+              </span>
+              <span className="text-[11px] text-amber-200/90">
+                Fenêtre de reconnexion en cours ({disconnectGrace.secondsLeft}s)... Reprise automatique dès retour
+              </span>
+            </div>
+            <button
+              onClick={onBack}
+              className="ml-2 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold font-arcade transition"
+            >
+              Quitter
+            </button>
+          </div>
+        )}
+
+        {/* Opponent Disconnect Alert (Final) */}
+        {!disconnectGrace?.active && opponentDisconnected && !isWaitingOpponent && !isGameOver && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 bg-rose-950/90 border border-rose-500/50 text-rose-200 px-4 py-2.5 rounded-2xl shadow-2xl flex items-center gap-3 backdrop-blur-md">
+            <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-ping" />
+            <span className="text-xs font-bold font-arcade">Adversaire parti ou délai de 30s expiré. Match clos.</span>
+            <button
+              onClick={onBack}
+              className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold font-arcade transition"
+            >
+              Quitter
+            </button>
+          </div>
+        )}
+
         {/* Waiting for Opponent */}
         {isWaitingOpponent && (
           <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center z-30">
@@ -596,18 +727,30 @@ export const CyberPong: React.FC<CyberPongProps> = ({
                 SALON CYBER PONG OUVERT
               </h3>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Invitez un rival à vous affronter en lui partageant le code du salon ci-dessous :
+                Partagez ce code ou envoyez directement le lien d'invitation à votre adversaire :
               </p>
 
-              <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-between gap-3">
-                <span className="text-xl font-black font-mono text-indigo-400 tracking-wider">
-                  #{currentRoom?.id}
-                </span>
+              {/* Share Code & Direct Link */}
+              <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between gap-3 pb-2 border-b border-slate-800">
+                  <span className="text-xl font-black font-mono text-indigo-400 tracking-wider">
+                    #{currentRoom?.id}
+                  </span>
+                  <button
+                    onClick={copyRoomCode}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-bold font-arcade border border-slate-700 transition"
+                  >
+                    {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedCode ? 'Copié !' : 'Copier Code'}
+                  </button>
+                </div>
+
                 <button
-                  onClick={copyRoomCode}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold font-arcade transition"
+                  onClick={copyDirectLink}
+                  className="w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-cyan-600 hover:from-indigo-500 hover:to-cyan-500 text-white text-xs font-bold font-arcade shadow-lg transition active:scale-95"
                 >
-                  {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />} Copier Code
+                  {copiedLink ? <Check className="w-4 h-4 text-emerald-300" /> : <Share2 className="w-4 h-4" />}
+                  {copiedLink ? 'Lien d\'invitation copié !' : 'Copier le Lien Direct d\'Invitation'}
                 </button>
               </div>
 

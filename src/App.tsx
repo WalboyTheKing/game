@@ -12,6 +12,12 @@ import { getStorageData } from './utils/storage';
 import { getUserProfile, UserProfile } from './utils/userProfile';
 import { sounds } from './utils/audio';
 import { socket } from './utils/socket';
+import { 
+  fetchGlobalLeaderboard, 
+  fetchRecentMatches, 
+  GlobalLeaderboardPlayer, 
+  MatchHistoryLog 
+} from './utils/multiplayerStats';
 
 type ActiveView = 'dashboard' | 'runner' | 'shooter' | 'snake' | 'tile' | 'hockey' | 'pong';
 
@@ -25,15 +31,69 @@ export const App: React.FC = () => {
   const [lobbyGameType, setLobbyGameType] = useState<'hockey' | 'pong'>('hockey');
   const [activeRoomData, setActiveRoomData] = useState<any>(null);
   const [activeRole, setActiveRole] = useState<string>('player1');
+  const [globalLeaderboard, setGlobalLeaderboard] = useState<GlobalLeaderboardPlayer[]>([]);
+  const [recentMatches, setRecentMatches] = useState<MatchHistoryLog[]>([]);
+
+  const loadStats = () => {
+    fetchGlobalLeaderboard().then(setGlobalLeaderboard);
+    fetchRecentMatches().then(setRecentMatches);
+  };
 
   useEffect(() => {
     // Auto initialize WebSocket connection in background
     socket.connect();
+    loadStats();
+
+    // Auto-join via URL direct invitation (e.g. ?join=AIR-123)
+    const params = new URLSearchParams(window.location.search);
+    const joinCode = params.get('join') || params.get('room');
+
+    if (joinCode) {
+      const targetCode = joinCode.toUpperCase().trim();
+      const tryJoin = () => {
+        sounds.playLaser();
+        socket.send({
+          type: 'join_room',
+          roomId: targetCode,
+          username: userProfile.username,
+          avatar: userProfile.avatar,
+          playerKey: userProfile.id,
+        });
+      };
+
+      if (socket.isConnected()) {
+        tryJoin();
+      } else {
+        const unsub = socket.on('connection_open', () => {
+          tryJoin();
+          unsub();
+        });
+      }
+    }
+
+    const unsubJoined = socket.on('room_joined', (data) => {
+      handleRoomJoined(data.room, data.role);
+    });
+
+    const unsubReconnected = socket.on('room_reconnected', (data) => {
+      handleRoomJoined(data.room, data.role);
+    });
+
+    const unsubOver = socket.on('game_over', () => {
+      setTimeout(() => loadStats(), 1000);
+    });
+
+    return () => {
+      unsubJoined();
+      unsubReconnected();
+      unsubOver();
+    };
   }, []);
 
   const refreshData = () => {
     setStorageData(getStorageData());
     setUserProfile(getUserProfile());
+    loadStats();
   };
 
   const handleToggleMute = () => {
@@ -50,12 +110,21 @@ export const App: React.FC = () => {
       socket.send({ type: 'leave_room' });
       setActiveRoomData(null);
     }
+    // Clean up URL if query param was present
+    if (window.location.search) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
     refreshData();
     setActiveView('dashboard');
   };
 
   const handleOpenLobby = (gameType: 'hockey' | 'pong' = 'hockey') => {
     setLobbyGameType(gameType);
+    setIsLobbyOpen(true);
+  };
+
+  const handleQuickMatch = () => {
+    setLobbyGameType('hockey');
     setIsLobbyOpen(true);
   };
 
@@ -80,11 +149,14 @@ export const App: React.FC = () => {
               setActiveView(gameId);
             }}
             onOpenMultiplayerLobby={handleOpenLobby}
+            onQuickMatch={handleQuickMatch}
             onOpenProfile={() => setIsProfileOpen(true)}
             profile={userProfile}
             highScores={storageData.scores}
             history={storageData.history}
             achievements={storageData.achievements}
+            globalLeaderboard={globalLeaderboard}
+            recentMatches={recentMatches}
             coins={storageData.coins}
             isMuted={isMuted}
             onToggleMute={handleToggleMute}
@@ -161,7 +233,10 @@ export const App: React.FC = () => {
         profile={userProfile}
         isOpen={isProfileOpen}
         onClose={() => setIsProfileOpen(false)}
-        onSave={(updated) => setUserProfile(updated)}
+        onSave={(updated) => {
+          setUserProfile(updated);
+          loadStats();
+        }}
       />
 
       {/* Footer */}

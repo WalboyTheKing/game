@@ -9,7 +9,10 @@ import {
   Rocket, 
   ArrowRight,
   Sparkles,
-  Gamepad2
+  Gamepad2,
+  Share2,
+  Check,
+  Zap
 } from 'lucide-react';
 import { socket } from '../../utils/socket';
 import { UserProfile } from '../../utils/userProfile';
@@ -74,6 +77,12 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
       onClose();
     });
 
+    const unsubReconnected = socket.on('room_reconnected', (data) => {
+      sounds.playPowerUp();
+      onRoomJoined(data.room, data.role);
+      onClose();
+    });
+
     const unsubError = socket.on('error', (data) => {
       setErrorMsg(data.message || 'Une erreur est survenue.');
     });
@@ -81,15 +90,47 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
     return () => {
       unsubRooms();
       unsubJoined();
+      unsubReconnected();
       unsubError();
     };
   }, [isOpen, onRoomJoined, onClose]);
 
   if (!isOpen) return null;
 
+  const [copiedRoomId, setCopiedRoomId] = useState<string | null>(null);
+
   const handleRefresh = () => {
     setIsRefreshing(true);
     socket.send({ type: 'list_rooms' });
+  };
+
+  const copyLinkForRoom = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (typeof window !== 'undefined') {
+      const url = `${window.location.origin}${window.location.pathname}?join=${id}`;
+      navigator.clipboard.writeText(url);
+      setCopiedRoomId(id);
+      setTimeout(() => setCopiedRoomId(null), 2500);
+    }
+  };
+
+  const handleQuickMatch = () => {
+    setErrorMsg('');
+    const available = rooms.find(r => r.status === 'waiting' && r.playerCount === 1);
+    if (available) {
+      handleJoinById(available.id);
+    } else {
+      sounds.playPowerUp();
+      socket.send({
+        type: 'create_room',
+        gameType: initialGameType || 'hockey',
+        name: `Arène Rapide de ${profile.username}`,
+        maxScore: 5,
+        username: profile.username,
+        avatar: profile.avatar,
+        playerKey: profile.id,
+      });
+    }
   };
 
   const handleCreateRoom = (e: React.FormEvent) => {
@@ -102,6 +143,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
       maxScore,
       username: profile.username,
       avatar: profile.avatar,
+      playerKey: profile.id,
     });
   };
 
@@ -113,6 +155,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
       roomId: roomId.toUpperCase().trim(),
       username: profile.username,
       avatar: profile.avatar,
+      playerKey: profile.id,
     });
   };
 
@@ -196,6 +239,26 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                 </button>
               </div>
 
+              {/* Quick Match Bar */}
+              <div className="p-3 rounded-2xl bg-gradient-to-r from-cyan-950/60 via-indigo-950/60 to-slate-950 border border-cyan-500/30 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-xl bg-cyan-500/20 text-cyan-300">
+                    <Zap className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold font-arcade text-white block">Matchmaking Rapide</span>
+                    <span className="text-[11px] text-slate-400">Rejoint un rival en attente ou crée un salon public</span>
+                  </div>
+                </div>
+
+                <button
+                  onClick={handleQuickMatch}
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-600 hover:to-indigo-700 text-white text-xs font-bold font-arcade shadow-lg transition active:scale-95"
+                >
+                  Trouver un Match
+                </button>
+              </div>
+
               {/* Header with Refresh */}
               <div className="flex items-center justify-between pt-1">
                 <span className="text-xs uppercase tracking-wider text-slate-400 font-bold">
@@ -247,7 +310,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                           </div>
                         </div>
 
-                        <div className="flex items-center justify-between sm:justify-end gap-3 border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-800">
+                        <div className="flex items-center justify-between sm:justify-end gap-2 border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-800">
                           <span
                             className={`text-[11px] font-bold px-2.5 py-1 rounded-full border ${
                               isFull
@@ -259,8 +322,16 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
                           </span>
 
                           <button
+                            onClick={(e) => copyLinkForRoom(r.id, e)}
+                            className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition"
+                            title="Copier le lien direct du salon"
+                          >
+                            {copiedRoomId === r.id ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Share2 className="w-3.5 h-3.5" />}
+                          </button>
+
+                          <button
                             onClick={() => handleJoinById(r.id)}
-                            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white font-bold font-arcade text-xs shadow transition active:scale-95"
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white font-bold font-arcade text-xs shadow transition active:scale-95"
                           >
                             Rejoindre <ArrowRight className="w-3.5 h-3.5" />
                           </button>

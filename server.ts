@@ -3,12 +3,22 @@ import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 const HOST = '0.0.0.0';
+
+const DATA_DIR = path.resolve(__dirname, 'data');
+const LEADERBOARD_FILE = path.join(DATA_DIR, 'leaderboard.json');
+const MATCHES_FILE = path.join(DATA_DIR, 'matches.json');
+
+// Ensure data directory exists
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -21,16 +31,31 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', time: Date.now() });
 });
 
+// Global Multiplayer Leaderboard & Recent Matches API
+app.get('/api/leaderboard', (_req, res) => {
+  const list = Array.from(leaderboard.values())
+    .sort((a, b) => b.wins !== a.wins ? b.wins - a.wins : b.goals - a.goals)
+    .slice(0, 20);
+  res.json({ leaderboard: list });
+});
+
+app.get('/api/matches', (_req, res) => {
+  res.json({ matches: recentMatches.slice(0, 20) });
+});
+
 // -------------------------------------------------------------
 // REAL-TIME MULTIPLAYER ROOMS & AUTHORITATIVE PHYSICS ENGINE
 // -------------------------------------------------------------
 
 interface RoomPlayer {
   id: string;
+  playerKey: string;
   username: string;
   avatar: string;
   role: 'player1' | 'player2';
   ready: boolean;
+  connected: boolean;
+  disconnectedAt?: number;
   x: number;
   y: number;
   prevX: number;
@@ -65,6 +90,100 @@ interface Room {
   lastActive: number;
 }
 
+interface LeaderboardEntry {
+  username: string;
+  avatar: string;
+  wins: number;
+  matches: number;
+  goals: number;
+  winrate: number;
+  lastActive: string;
+}
+
+interface MatchHistoryEntry {
+  id: string;
+  gameType: 'hockey' | 'pong';
+  p1: string;
+  p2: string;
+  score1: number;
+  score2: number;
+  winner: string;
+  time: string;
+}
+
+const leaderboard: Map<string, LeaderboardEntry> = new Map();
+let recentMatches: MatchHistoryEntry[] = [];
+
+// Load persistent data from disk
+function loadPersistentData() {
+  try {
+    if (fs.existsSync(LEADERBOARD_FILE)) {
+      const raw = fs.readFileSync(LEADERBOARD_FILE, 'utf-8');
+      const data: LeaderboardEntry[] = JSON.parse(raw);
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          leaderboard.set(item.username, item);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Persistence] Error loading leaderboard:', err);
+  }
+
+  try {
+    if (fs.existsSync(MATCHES_FILE)) {
+      const raw = fs.readFileSync(MATCHES_FILE, 'utf-8');
+      const data: MatchHistoryEntry[] = JSON.parse(raw);
+      if (Array.isArray(data)) {
+        recentMatches = data;
+      }
+    }
+  } catch (err) {
+    console.error('[Persistence] Error loading matches:', err);
+  }
+
+  // If initial store is empty, seed realistic competitive records
+  if (leaderboard.size === 0) {
+    const seedLeaderboard: LeaderboardEntry[] = [
+      { username: 'CyberPhantom', avatar: '⚡', wins: 18, matches: 21, goals: 74, winrate: 86, lastActive: 'Aujourd\'hui' },
+      { username: 'NeonStriker', avatar: '👑', wins: 15, matches: 19, goals: 62, winrate: 79, lastActive: 'Aujourd\'hui' },
+      { username: 'QuantumAce', avatar: '🚀', wins: 12, matches: 16, goals: 48, winrate: 75, lastActive: 'Hier' },
+      { username: 'PulseViper', avatar: '🔥', wins: 9, matches: 14, goals: 39, winrate: 64, lastActive: 'Hier' },
+    ];
+    for (const item of seedLeaderboard) {
+      leaderboard.set(item.username, item);
+    }
+    saveLeaderboard();
+  }
+
+  if (recentMatches.length === 0) {
+    recentMatches = [
+      { id: 'm1_demo', gameType: 'hockey', p1: 'CyberPhantom', p2: 'NeonStriker', score1: 5, score2: 3, winner: 'CyberPhantom', time: '14:22:10' },
+      { id: 'm2_demo', gameType: 'pong', p1: 'QuantumAce', p2: 'PulseViper', score1: 5, score2: 4, winner: 'QuantumAce', time: '13:50:45' },
+    ];
+    saveMatches();
+  }
+}
+
+function saveLeaderboard() {
+  try {
+    const list = Array.from(leaderboard.values());
+    fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(list, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[Persistence] Failed to write leaderboard:', err);
+  }
+}
+
+function saveMatches() {
+  try {
+    fs.writeFileSync(MATCHES_FILE, JSON.stringify(recentMatches.slice(0, 50), null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[Persistence] Failed to write matches:', err);
+  }
+}
+
+loadPersistentData();
+
 const rooms: Map<string, Room> = new Map();
 const socketToRoom: Map<WebSocket, { roomId: string; playerId: string }> = new Map();
 
@@ -72,6 +191,7 @@ const TABLE_WIDTH = 800;
 const TABLE_HEIGHT = 500;
 const GOAL_TOP = 170;
 const GOAL_BOTTOM = 330;
+const RECONNECT_GRACE_MS = 30000; // 30 seconds true reconnection window
 
 function resetPuck(room: Room, direction: 'left' | 'right' | 'random' = 'random') {
   room.ball.x = TABLE_WIDTH / 2;
@@ -101,7 +221,7 @@ function broadcastRoomsList() {
     id: r.id,
     name: r.name,
     gameType: r.gameType,
-    playerCount: Object.keys(r.players).length,
+    playerCount: Object.values(r.players).filter(p => p.connected).length,
     status: r.status,
     score1: r.score1,
     score2: r.score2,
@@ -145,6 +265,30 @@ setInterval(() => {
     }
 
     if (room.status !== 'playing') continue;
+
+    // Check for expired reconnection window (30s)
+    let hasExpiredForfeit = false;
+    for (const player of Object.values(room.players)) {
+      if (!player.connected && player.disconnectedAt && (now - player.disconnectedAt > RECONNECT_GRACE_MS)) {
+        const opponent = Object.values(room.players).find(p => p.role !== player.role);
+        if (opponent) {
+          checkWinCondition(room, opponent.role);
+          broadcastToRoom(room, {
+            type: 'forfeit_timeout',
+            forfeitedUser: player.username,
+            winnerRole: opponent.role,
+            message: `${player.username} ne s'est pas reconnecté sous 30s. Victoire par forfait accordée!`,
+          });
+        }
+        delete room.players[player.id];
+        hasExpiredForfeit = true;
+        break;
+      }
+    }
+    if (hasExpiredForfeit) {
+      broadcastRoomsList();
+      continue;
+    }
 
     const b = room.ball;
     const p1 = Object.values(room.players).find(p => p.role === 'player1');
@@ -346,8 +490,30 @@ function checkWinCondition(room: Room, potentialWinnerRole: 'player1' | 'player2
   if (score >= target) {
     room.status = 'gameover';
     room.winner = potentialWinnerRole;
-    const winnerPlayer = Object.values(room.players).find(p => p.role === potentialWinnerRole);
+    const p1 = Object.values(room.players).find(p => p.role === 'player1');
+    const p2 = Object.values(room.players).find(p => p.role === 'player2');
+    const winnerPlayer = potentialWinnerRole === 'player1' ? p1 : p2;
     room.winnerName = winnerPlayer?.username || (potentialWinnerRole === 'player1' ? 'Player 1' : 'Player 2');
+
+    // Record Match into Global Match History
+    const matchRecord: MatchHistoryEntry = {
+      id: Math.random().toString(36).substring(2, 9),
+      gameType: room.gameType,
+      p1: p1?.username || 'Player 1',
+      p2: p2?.username || 'Player 2',
+      score1: room.score1,
+      score2: room.score2,
+      winner: room.winnerName,
+      time: new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    };
+    recentMatches.unshift(matchRecord);
+    if (recentMatches.length > 30) recentMatches.pop();
+    saveMatches();
+
+    // Update Global Leaderboard for both players
+    if (p1) updateLeaderboardUser(p1.username, p1.avatar, potentialWinnerRole === 'player1', room.score1);
+    if (p2) updateLeaderboardUser(p2.username, p2.avatar, potentialWinnerRole === 'player2', room.score2);
+    saveLeaderboard();
 
     broadcastToRoom(room, {
       type: 'game_over',
@@ -358,6 +524,28 @@ function checkWinCondition(room: Room, potentialWinnerRole: 'player1' | 'player2
     });
     broadcastRoomsList();
   }
+}
+
+function updateLeaderboardUser(username: string, avatar: string, won: boolean, goals: number) {
+  const existing = leaderboard.get(username) || {
+    username,
+    avatar: avatar || '🎮',
+    wins: 0,
+    matches: 0,
+    goals: 0,
+    winrate: 0,
+    lastActive: new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+  };
+
+  existing.avatar = avatar || existing.avatar;
+  existing.matches += 1;
+  existing.goals += goals;
+  if (won) existing.wins += 1;
+  existing.winrate = Math.round((existing.wins / existing.matches) * 100);
+  existing.lastActive = new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
+  leaderboard.set(username, existing);
+  saveLeaderboard();
 }
 
 // WebSocket Connection Handlers
@@ -374,21 +562,31 @@ wss.on('connection', (ws: WebSocket) => {
 
       // CREATE ROOM
       else if (msg.type === 'create_room') {
-        const roomId = (msg.gameType === 'pong' ? 'PONG-' : 'AIR-') + Math.floor(100 + Math.random() * 900);
+        const gameType = msg.gameType === 'pong' ? 'pong' : 'hockey';
+        const roomId = (gameType === 'pong' ? 'PONG-' : 'AIR-') + Math.floor(100 + Math.random() * 900);
+        const rawName = typeof msg.name === 'string' ? msg.name.trim().slice(0, 25) : '';
+        const name = rawName || `Arène ${gameType === 'pong' ? 'Pong' : 'Hockey'}`;
+        const maxScore = Math.max(1, Math.min(20, Math.floor(Number(msg.maxScore) || 5)));
+        const username = typeof msg.username === 'string' && msg.username.trim() ? msg.username.trim().slice(0, 18) : 'Host Pilot';
+        const avatar = typeof msg.avatar === 'string' && msg.avatar.trim() ? msg.avatar.slice(0, 4) : '🤖';
+        const playerKey = typeof msg.playerKey === 'string' && msg.playerKey.trim() ? msg.playerKey.trim() : playerId;
+
         const newRoom: Room = {
           id: roomId,
-          gameType: msg.gameType === 'pong' ? 'pong' : 'hockey',
-          name: msg.name || `Arena ${roomId}`,
+          gameType,
+          name,
           hostId: playerId,
-          maxScore: Number(msg.maxScore) || 5,
+          maxScore,
           players: {
             [playerId]: {
               id: playerId,
-              username: msg.username || 'Host Pilot',
-              avatar: msg.avatar || '🤖',
+              playerKey,
+              username,
+              avatar,
               role: 'player1',
               ready: true,
-              x: msg.gameType === 'pong' ? 35 : 120,
+              connected: true,
+              x: gameType === 'pong' ? 35 : 120,
               y: TABLE_HEIGHT / 2,
               prevX: 120,
               prevY: TABLE_HEIGHT / 2,
@@ -407,7 +605,7 @@ wss.on('connection', (ws: WebSocket) => {
             vx: 0,
             vy: 0,
             speed: 5,
-            radius: msg.gameType === 'pong' ? 9 : 14,
+            radius: gameType === 'pong' ? 9 : 14,
           },
           lastActive: Date.now(),
         };
@@ -425,25 +623,69 @@ wss.on('connection', (ws: WebSocket) => {
         broadcastRoomsList();
       }
 
-      // JOIN ROOM
-      else if (msg.type === 'join_room') {
-        const room = rooms.get(msg.roomId);
+      // JOIN ROOM OR RECONNECT TO ROOM
+      else if (msg.type === 'join_room' || msg.type === 'reconnect_room') {
+        const cleanRoomId = typeof msg.roomId === 'string' ? msg.roomId.trim().toUpperCase() : '';
+        const room = rooms.get(cleanRoomId);
         if (!room) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Salon introuvable.' }));
+          ws.send(JSON.stringify({ type: 'error', message: 'Salon introuvable ou déjà expiré.' }));
           return;
         }
 
-        const existingPlayers = Object.values(room.players);
+        const username = typeof msg.username === 'string' && msg.username.trim() ? msg.username.trim().slice(0, 18) : 'Challenger';
+        const avatar = typeof msg.avatar === 'string' && msg.avatar.trim() ? msg.avatar.slice(0, 4) : '⚡';
+        const playerKey = typeof msg.playerKey === 'string' && msg.playerKey.trim() ? msg.playerKey.trim() : '';
+
+        // Check if an existing player is disconnected and can resume their exact seat!
+        const existingDisconnectedPlayer = Object.values(room.players).find(
+          p => (!p.connected && ((playerKey && p.playerKey === playerKey) || p.username === username))
+        );
+
+        if (existingDisconnectedPlayer) {
+          // Re-bind the new socket to the preserved player
+          const oldSocketId = existingDisconnectedPlayer.id;
+          delete room.players[oldSocketId];
+
+          existingDisconnectedPlayer.id = playerId;
+          existingDisconnectedPlayer.connected = true;
+          existingDisconnectedPlayer.disconnectedAt = undefined;
+          room.players[playerId] = existingDisconnectedPlayer;
+
+          room.lastActive = Date.now();
+          socketToRoom.set(ws, { roomId: room.id, playerId });
+
+          ws.send(JSON.stringify({
+            type: 'room_reconnected',
+            room,
+            role: existingDisconnectedPlayer.role,
+            myId: playerId,
+          }));
+
+          broadcastToRoom(room, {
+            type: 'player_reconnected',
+            room,
+            playerId,
+            username: existingDisconnectedPlayer.username,
+            role: existingDisconnectedPlayer.role,
+          });
+
+          broadcastRoomsList();
+          return;
+        }
+
+        const existingConnectedPlayers = Object.values(room.players).filter(p => p.connected);
         let assignedRole: 'player1' | 'player2' | 'spectator' = 'spectator';
 
-        if (existingPlayers.length < 2) {
+        if (existingConnectedPlayers.length < 2) {
           assignedRole = 'player2';
           room.players[playerId] = {
             id: playerId,
-            username: msg.username || 'Challenger',
-            avatar: msg.avatar || '⚡',
+            playerKey: playerKey || playerId,
+            username,
+            avatar,
             role: 'player2',
             ready: true,
+            connected: true,
             x: room.gameType === 'pong' ? TABLE_WIDTH - 35 : TABLE_WIDTH - 120,
             y: TABLE_HEIGHT / 2,
             prevX: TABLE_WIDTH - 120,
@@ -453,7 +695,7 @@ wss.on('connection', (ws: WebSocket) => {
           };
 
           // If both players present and ready -> start countdown!
-          if (Object.keys(room.players).length === 2) {
+          if (Object.values(room.players).filter(p => p.connected).length === 2) {
             room.status = 'countdown';
             room.countdown = 3;
           }
@@ -482,13 +724,13 @@ wss.on('connection', (ws: WebSocket) => {
         const room = rooms.get(info.roomId);
         if (!room) return;
         const player = room.players[info.playerId];
-        if (!player) return;
+        if (!player || !player.connected) return;
 
         room.lastActive = Date.now();
 
         // Calculate velocity for impulse collisions
-        const currentX = typeof msg.x === 'number' ? msg.x : player.x;
-        const currentY = typeof msg.y === 'number' ? msg.y : player.y;
+        const currentX = typeof msg.x === 'number' && !isNaN(msg.x) ? msg.x : player.x;
+        const currentY = typeof msg.y === 'number' && !isNaN(msg.y) ? msg.y : player.y;
 
         player.vx = (currentX - player.prevX) * 0.8;
         player.vy = (currentY - player.prevY) * 0.8;
@@ -523,6 +765,7 @@ wss.on('connection', (ws: WebSocket) => {
         room.winnerName = undefined;
         resetPuck(room, 'random');
 
+        broadcastToRoom(room, { type: 'rematch_started', room });
         broadcastToRoom(room, { type: 'room_update', room });
         broadcastRoomsList();
       }
@@ -545,7 +788,7 @@ wss.on('connection', (ws: WebSocket) => {
 
       // LEAVE ROOM
       else if (msg.type === 'leave_room') {
-        handleDisconnect(ws);
+        handleDisconnect(ws, true);
       }
     } catch (err) {
       console.error('Error handling WS message:', err);
@@ -553,15 +796,15 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   ws.on('close', () => {
-    handleDisconnect(ws);
+    handleDisconnect(ws, false);
   });
 
   ws.on('error', () => {
-    handleDisconnect(ws);
+    handleDisconnect(ws, false);
   });
 });
 
-function handleDisconnect(ws: WebSocket) {
+function handleDisconnect(ws: WebSocket, explicitLeave: boolean = false) {
   const info = socketToRoom.get(ws);
   if (!info) return;
 
@@ -569,15 +812,43 @@ function handleDisconnect(ws: WebSocket) {
   socketToRoom.delete(ws);
 
   if (room) {
-    delete room.players[info.playerId];
-    room.spectators = room.spectators.filter(id => id !== info.playerId);
+    const player = room.players[info.playerId];
 
-    if (Object.keys(room.players).length === 0) {
-      rooms.delete(room.id);
+    if (player) {
+      // If the match is currently playing and wasn't an explicit voluntary leave:
+      // Give a 30-second grace window to reconnect without destroying the game!
+      if (!explicitLeave && (room.status === 'playing' || room.status === 'countdown')) {
+        player.connected = false;
+        player.disconnectedAt = Date.now();
+        broadcastToRoom(room, {
+          type: 'player_disconnected_grace',
+          playerId: player.id,
+          username: player.username,
+          role: player.role,
+          graceSeconds: 30,
+        });
+      } else {
+        // Explicit exit or room in waiting/gameover: remove immediately
+        delete room.players[info.playerId];
+        if (Object.keys(room.players).length === 0) {
+          rooms.delete(room.id);
+        } else {
+          if (room.status === 'playing') {
+            // Forfeit win for the remaining player
+            const remaining = Object.values(room.players)[0];
+            if (remaining) {
+              checkWinCondition(room, remaining.role);
+            }
+          } else {
+            room.status = 'waiting';
+            broadcastToRoom(room, { type: 'player_left', room });
+          }
+        }
+      }
     } else {
-      room.status = 'waiting';
-      broadcastToRoom(room, { type: 'player_left', room });
+      room.spectators = room.spectators.filter(id => id !== info.playerId);
     }
+
     broadcastRoomsList();
   }
 }
